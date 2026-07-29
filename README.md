@@ -7,15 +7,20 @@ committed and pushed.
 
 ```
 ⚡ web-app
-    git · +2 ~1 ?3    ← agents panel (default mode, stock herdr)
+    git · +2 ~1 ?3    ← agents panel (agents-panel mode)
 
 ⚡ api
     git · ✓           ← fully clean: nothing to commit, push, or pull
 
 ● web-app
     main ↑1
-    +2 ~1 ?3          ← spaces card (sidebar mode, patched herdr)
+    +2 ~1 ?3          ← spaces card (sidebar mode)
 ```
+
+Both modes work on **stock herdr 0.7.5+**; each needs a one-line addition to your
+herdr `config.toml` naming the plugin's tokens (see
+[Install](#install)). Severity is colour-coded — green `✓`, yellow for changes,
+red for conflicts — via a per-token `fg` you control.
 
 The status token is compact and only shows what's non-zero:
 
@@ -53,11 +58,17 @@ herdr server — herdr compiles the plugin at install time via
 `cargo build --release`. Plugins run on the machine hosting the herdr server, so
 remote setups need these on the server box only.
 
-That's it — the default mode works on stock herdr, no patches or extra setup.
+**One required step on herdr 0.7.5+**: the status rides a *named metadata token*,
+and herdr only draws tokens its sidebar config asks for. herdr's default rows do
+**not** reference them, so until you add the `$git_clean` / `$git_dirty` /
+`$git_conflict` rows to your own `config.toml` (see
+[herdr 0.7.5+](#herdr-075-native-sidebar-tokens--no-patch-needed) below) the
+plugin runs but **nothing appears**. No patched herdr build is needed.
 
 ## Usage
 
-Toggle the background updater (statuses appear in the agents panel within ~5s):
+Toggle the background updater (statuses appear within ~5s, *once* the `$git_*`
+token rows are in your herdr `config.toml` — see above):
 
 ```sh
 herdr plugin action invoke status-toggle --plugin ez-corp.git-status
@@ -82,8 +93,8 @@ Configure in `$HERDR_PLUGIN_CONFIG_DIR/config.toml`
 (herdr prints the config dir via `herdr plugin config-dir ez-corp.git-status`):
 
 ```toml
-mode = "agents-panel"       # default — works on stock herdr
-# mode = "sidebar"          # for herdr builds with the sidebar patch (below)
+mode = "agents-panel"       # default — token lands on the agents-panel row
+# mode = "sidebar"          # token lands on the spaces card (native on 0.7.5+)
 
 # Refresh cadence in seconds (>= 1). Default 5.
 interval_seconds = 5
@@ -94,10 +105,16 @@ clean_checkmark = true
 ```
 
 - **agents-panel** (default): each space gets a `git` pseudo-agent entry in the
-  sidebar agents panel, carrying the status token.
-- **sidebar**: renders the status inside each spaces card, under the branch name.
+  sidebar agents panel, carrying the status token. Reference the `$git_*` tokens
+  under `[ui.sidebar.agents]`.
+- **sidebar**: reports the token on the *workspace*, so it renders inside each
+  spaces card under the branch name. Reference the `$git_*` tokens under
+  `[ui.sidebar.spaces]`. (The spaces card renders workspace tokens; a pane token
+  only reaches the agents panel — that is the difference between the two modes.)
 
-Switching modes cleans up after the other mode automatically.
+Switching modes cleans up after the other mode automatically. Whichever mode you
+pick, the matching `[ui.sidebar.*]` rows must name the `$git_*` tokens, and a
+running herdr needs `herdr server reload-config` after you edit them.
 
 ### herdr 0.7.5+ (native sidebar tokens — no patch needed)
 
