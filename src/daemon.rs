@@ -7,7 +7,10 @@
 //! (nothing to commit, push, or pull) reports `✓` unless `clean_checkmark =
 //! false`; a space with an empty status (non-repo, or clean-but-diverged) has
 //! any previous status actively cleared so no stale row lingers. `enable` /
-//! `disable` / `toggle` spawn or signal that daemon and sweep leftover statuses.
+//! `disable` / `toggle` spawn or signal that daemon and sweep leftover statuses,
+//! and `restore` (herdr's `[[startup]]` hook) brings it back after a herdr or
+//! machine restart when an `enabled` marker alongside the pid file says it was
+//! wanted.
 
 use std::collections::{HashMap, HashSet};
 use std::os::unix::process::CommandExt;
@@ -64,20 +67,26 @@ pub struct Tracked {
     pub workspaces: HashMap<String, &'static str>,
 }
 
-/// PID of a live updater daemon, or `None` (missing pid file / dead process).
+/// PID of a live updater daemon, or `None` (missing pid file / dead process /
+/// a pid that no longer belongs to us).
 ///
-/// Reads `<state_dir>/updater.pid` and probes the process with `kill(pid, 0)`
-/// (signal 0 checks existence only). Any failure — no file, unparsable content,
-/// a non-positive pid, or a dead/unsignalable process — reads as `None`.
+/// Reads `<state_dir>/updater.pid`, probes the process with `kill(pid, 0)`
+/// (signal 0 checks existence only), and then confirms the pid really is one of
+/// our processes. That last check matters: the state dir outlives reboots, so an
+/// unclean shutdown can leave a pid file pointing at a pid the kernel later
+/// recycled for something else — and without it `--enable` would no-op forever
+/// against that impostor, leaving the sidebar permanently blank.
 pub fn daemon_pid() -> Option<u32> {
     let text = std::fs::read_to_string(config::pid_file()).ok()?;
     let pid: i32 = text.trim().parse().ok()?;
-    // SAFETY: `kill` with signal 0 performs no delivery, only a liveness probe.
-    if pid > 0 && unsafe { libc::kill(pid, 0) } == 0 {
-        Some(pid as u32)
-    } else {
-        None
+    if pid <= 0 {
+        return None;
     }
+    // SAFETY: `kill` with signal 0 performs no delivery, only a liveness probe.
+    if unsafe { libc::kill(pid, 0) } != 0 {
+        return None;
+    }
+    is_our_process(pid as u32).then_some(pid as u32)
 }
 
 /// `--daemon`: run the updater loop until signalled, then clear and exit.
@@ -151,37 +160,43 @@ pub fn run_daemon() -> crate::Result<()> {
     }
 }
 
-/// `--enable`: spawn a detached `--daemon` process (no-op if already running).
+/// `--enable`: record that the updater is wanted and spawn a detached `--daemon`
+/// process (spawn is a no-op if one is already running).
 pub fn enable_updater() -> crate::Result<()> {
+    // Record the intent first, so the `[[startup]]` hook restores the updater
+    // after a restart even if the spawn below fails.
+    set_enabled(&config::enabled_flag(), true);
+
     if daemon_pid().is_some() {
         notify("git status updater already enabled");
         return Ok(());
     }
-
-    // Re-exec ourselves as the daemon, fully detached: a new session (setsid) so
-    // it survives the controlling terminal, and null stdio.
-    let exe = std::env::current_exe()?;
-    let mut cmd = Command::new(exe);
-    cmd.arg("--daemon")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    // SAFETY: `setsid` is async-signal-safe and the only action taken in the
-    // forked child before exec; it starts a new session, detaching the daemon.
-    unsafe {
-        cmd.pre_exec(|| match libc::setsid() {
-            -1 => Err(std::io::Error::last_os_error()),
-            _ => Ok(()),
-        });
-    }
-    cmd.spawn()?; // do not wait — the child outlives us and is reaped by init
-
+    spawn_daemon()?;
     notify("git status updater enabled");
     Ok(())
 }
 
-/// `--disable`: signal the daemon and sweep any leftover statuses.
+/// `--restore`: herdr's `[[startup]]` hook — bring the updater back after a herdr
+/// or machine restart, but only if it was enabled when herdr went away.
+///
+/// Silent by design: a restart is not a user action, so it raises no toast. Both
+/// gates are no-ops rather than errors — an updater that was never enabled stays
+/// off, and a live one (herdr re-runs startup hooks on every live handoff too) is
+/// left alone.
+pub fn restore_updater() -> crate::Result<()> {
+    if !enabled_flag_set(&config::enabled_flag()) || daemon_pid().is_some() {
+        return Ok(());
+    }
+    spawn_daemon()
+}
+
+/// `--disable`: clear the wanted flag, signal the daemon, and sweep any leftover
+/// statuses.
 pub fn disable_updater() -> crate::Result<()> {
+    // Clear the intent so the `[[startup]]` hook does not resurrect the updater
+    // on the next herdr restart.
+    set_enabled(&config::enabled_flag(), false);
+
     if let Some(pid) = daemon_pid() {
         // The daemon clears its own statuses on shutdown; best-effort.
         // SAFETY: `kill` merely posts SIGTERM to the pid; failure is ignored.
@@ -381,6 +396,82 @@ fn clear_stale_workspace_token(
 
 // ---- helpers ----------------------------------------------------------------
 
+/// Re-exec ourselves as a detached `--daemon` process.
+///
+/// Fully detached: a new session (setsid) so it survives the controlling
+/// terminal — which is what lets the daemon outlive the short-lived `--enable` /
+/// `--restore` command herdr spawned it from — and null stdio.
+fn spawn_daemon() -> crate::Result<()> {
+    let exe = std::env::current_exe()?;
+    let mut cmd = Command::new(exe);
+    cmd.arg("--daemon")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // SAFETY: `setsid` is async-signal-safe and the only action taken in the
+    // forked child before exec; it starts a new session, detaching the daemon.
+    unsafe {
+        cmd.pre_exec(|| match libc::setsid() {
+            -1 => Err(std::io::Error::last_os_error()),
+            _ => Ok(()),
+        });
+    }
+    cmd.spawn()?; // do not wait — the child outlives us and is reaped by init
+    Ok(())
+}
+
+/// Create (`true`) or remove (`false`) the "updater wanted" marker at `path`.
+///
+/// Best-effort: the marker only drives restart recovery, so a state dir we cannot
+/// write must not fail the enable/disable the user actually asked for.
+fn set_enabled(path: &std::path::Path, enabled: bool) {
+    if !enabled {
+        let _ = std::fs::remove_file(path);
+        return;
+    }
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(path, "1\n");
+}
+
+/// Whether the "updater wanted" marker at `path` exists.
+fn enabled_flag_set(path: &std::path::Path) -> bool {
+    path.exists()
+}
+
+/// Whether `pid` is one of *our* processes, compared via `/proc/<pid>/comm`
+/// against our own.
+///
+/// Guards pid reuse behind a stale pid file. Anything unreadable — a vanished
+/// process, or one owned by another user — reads as "not ours", which is the
+/// safe answer: we then treat the updater as down and start a fresh one.
+#[cfg(target_os = "linux")]
+fn is_our_process(pid: u32) -> bool {
+    match (
+        comm_of(&format!("/proc/{pid}/comm")),
+        comm_of("/proc/self/comm"),
+    ) {
+        (Some(theirs), Some(ours)) => theirs == ours,
+        _ => false,
+    }
+}
+
+/// macOS has no `/proc`, so the pid-reuse guard degrades to the `kill(pid, 0)`
+/// liveness probe alone — the behaviour this plugin has always had there.
+#[cfg(not(target_os = "linux"))]
+fn is_our_process(_pid: u32) -> bool {
+    true
+}
+
+/// Trimmed contents of a `/proc/<pid>/comm` path, or `None` if unreadable.
+#[cfg(target_os = "linux")]
+fn comm_of(path: &str) -> Option<String> {
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|text| text.trim().to_string())
+}
+
 /// Clear tracked statuses, unlink the pid file, and `exit(0)`.
 ///
 /// Shared by the signal thread (own connection) and the five-failure path (main
@@ -510,5 +601,61 @@ mod tests {
     fn non_repo_space_status_is_empty() {
         let sp = Space::default(); // is_repo = false
         assert!(space_status(&sp, &Config::default()).is_empty());
+    }
+
+    // ---- restart recovery ---------------------------------------------------
+
+    /// Unique scratch dir under the system tmpdir, keyed by test name + pid so
+    /// parallel test threads never collide.
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "git-status-test-{name}-{}-{:?}",
+            std::process::id(),
+            thread::current().id(),
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    #[test]
+    fn enabled_flag_round_trips_and_creates_missing_state_dir() {
+        // Point at a *nested* dir that does not exist yet — enabling must create
+        // it, mirroring a fresh install whose state dir herdr has not made.
+        let flag = scratch("flag").join("nested").join("enabled");
+        assert!(
+            !enabled_flag_set(&flag),
+            "absent before anything is written"
+        );
+
+        set_enabled(&flag, true);
+        assert!(enabled_flag_set(&flag), "set after --enable");
+
+        set_enabled(&flag, false);
+        assert!(!enabled_flag_set(&flag), "cleared after --disable");
+
+        // Clearing an already-absent flag is a no-op, not an error.
+        set_enabled(&flag, false);
+        assert!(!enabled_flag_set(&flag));
+    }
+
+    #[test]
+    fn our_own_pid_is_recognised_as_ours() {
+        assert!(is_our_process(std::process::id()));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn vanished_pid_is_not_ours() {
+        // No `/proc/<pid>/comm` to read — the stale-pid-file case must read as
+        // "not ours" so the caller starts a fresh daemon. Linux-only: without
+        // `/proc` the guard degrades to the liveness probe alone.
+        assert!(!is_our_process(u32::MAX));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn comm_of_unreadable_path_is_none() {
+        assert_eq!(comm_of("/proc/nonexistent-pid/comm"), None);
     }
 }

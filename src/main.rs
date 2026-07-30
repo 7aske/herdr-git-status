@@ -15,6 +15,8 @@
 //!   --enable          start the sidebar status updater daemon
 //!   --disable         stop the daemon and clear statuses
 //!   --toggle          enable/disable depending on daemon state
+//!   --restore         internal: herdr `[[startup]]` hook — re-enable after a
+//!                     herdr/machine restart if the updater was enabled
 //!   --daemon          internal: run the updater loop (spawned by --enable)
 //!
 //! No `/proc` dependency — the status comes entirely from `git`. herdr injects
@@ -58,6 +60,9 @@ fn run() -> Result<()> {
     }
     if has_flag(&args, "--toggle") {
         return daemon::toggle_updater();
+    }
+    if has_flag(&args, "--restore") {
+        return daemon::restore_updater();
     }
 
     // Read modes share one socket connection.
