@@ -3,8 +3,8 @@
 //! [`Space`] is the internal per-workspace aggregate; [`GitStatus`] is the
 //! working-tree summary [`crate::git`] fills in for each space. The remaining
 //! types are `serde` views over the `result` payloads of the herdr socket read
-//! methods we call (`workspace.list`, `pane.list`, `worktree.list`). Each only
-//! declares the fields we consume; serde ignores the rest of herdr's payload.
+//! methods we call (`session.snapshot`, `worktree.list`). Each only declares the
+//! fields we consume; serde ignores the rest of herdr's payload.
 
 use serde::Deserialize;
 
@@ -77,16 +77,29 @@ pub struct Space {
     pub family_parent: Option<String>,
 }
 
-// ---- workspace.list ---------------------------------------------------------
+// ---- session.snapshot -------------------------------------------------------
 //
-// result = { "type": "workspace_list", "workspaces": [ { workspace_id, label,
-//            focused, .. } ] }
+// result = { "type": "session_snapshot", "snapshot": { workspaces: [ .. ],
+//            panes: [ .. ], tabs, layouts, agents, .. } }
+//
+// One atomic read replaces `workspace.list` + one `pane.list` per workspace:
+// those were separate round trips, so a workspace closing between them answered
+// `workspace_not_found` and failed the whole enumeration. Every pane in the
+// session arrives in one list, tagged with its `workspace_id`.
 
-/// `result` payload of `workspace.list`.
+/// `result` payload of `session.snapshot` — note the nested `snapshot` object.
 #[derive(Debug, Clone, Deserialize)]
-pub struct WorkspaceListResult {
+pub struct SessionSnapshotResult {
+    pub snapshot: SessionSnapshot,
+}
+
+/// The snapshot body; only the two collections we consume are modelled.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SessionSnapshot {
     #[serde(default)]
     pub workspaces: Vec<WorkspaceInfo>,
+    #[serde(default)]
+    pub panes: Vec<PaneInfo>,
 }
 
 /// One entry of `workspaces`; only the fields we consume are modelled.
@@ -99,21 +112,16 @@ pub struct WorkspaceInfo {
     pub focused: bool,
 }
 
-// ---- pane.list --------------------------------------------------------------
-//
-// result = { "type": "pane_list", "panes": [ { pane_id, cwd?, agent?, .. } ] }
-
-/// `result` payload of `pane.list`.
-#[derive(Debug, Clone, Deserialize)]
-pub struct PaneListResult {
-    #[serde(default)]
-    pub panes: Vec<PaneInfo>,
-}
-
 /// One entry of `panes`; only the fields we consume are modelled.
+///
+/// Deliberately omits herdr's `foreground_cwd` — see
+/// [`crate::collect::space_from`] for why `cwd` is the only safe choice.
 #[derive(Debug, Clone, Deserialize)]
 pub struct PaneInfo {
     pub pane_id: String,
+    /// Owning workspace, which is how the flat `panes` list is regrouped.
+    #[serde(default)]
+    pub workspace_id: String,
     #[serde(default)]
     pub cwd: Option<String>,
     #[serde(default)]

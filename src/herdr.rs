@@ -6,14 +6,17 @@
 //!   success : `{"id":..,"result":{"type":"<snake>",...}}`
 //!   failure : `{"id":..,"error":{"code":..,"message":..}}`
 //! Any non-`error` envelope is treated as success (mutations return
-//! `{"type":"ok"}`). Method + param field names are verified against herdr 0.7.1
-//! source: methods in `src/api/server.rs` / `src/api/schema.rs`, params in
-//! `src/api/schema/panes.rs` (`PaneReportAgentParams`, `PaneReleaseAgentParams`,
-//! `PaneReportMetadataParams`) and `src/api/schema/common.rs`
-//! (`NotificationShowParams`). This plugin only reads workspace/pane/worktree
-//! lists (the git status itself comes from `git`, not the socket) and writes the
-//! status onto a pane; [`bin_path`] still exposes the `HERDR_BIN_PATH` CLI for a
-//! degraded fallback (e.g. best-effort notifications without a socket).
+//! `{"type":"ok"}`). Method + param field names are verified against the running
+//! host's own contract — `herdr api schema` prints it, so it is the authority for
+//! whichever herdr is installed rather than a snapshot of one release's source.
+//! The definitions this file mirrors are `PaneReportAgentParams`,
+//! `PaneReleaseAgentParams`, `PaneReportMetadataParams`,
+//! `WorkspaceReportMetadataParams`, and `NotificationShowParams`; last checked
+//! against herdr 0.8.0 (protocol 19), unchanged since 0.7.5. This plugin only
+//! reads workspace/pane/worktree lists (the git status itself comes from `git`,
+//! not the socket) and writes the status onto a pane or workspace; [`bin_path`]
+//! still exposes the `HERDR_BIN_PATH` CLI for a degraded fallback (e.g.
+//! best-effort notifications without a socket).
 //!
 //! The socket path is resolved `HERDR_SOCKET_PATH` → `$XDG_CONFIG_HOME/herdr` →
 //! `~/.config/herdr/herdr.sock` (the XDG/home resolution is reused from
@@ -27,9 +30,7 @@ use std::time::Duration;
 use serde::Serialize;
 use serde_json::{json, Value};
 
-use crate::model::{
-    PaneInfo, PaneListResult, WorkspaceInfo, WorkspaceListResult, WorktreeListResult,
-};
+use crate::model::{SessionSnapshot, SessionSnapshotResult, WorktreeListResult};
 
 /// Read/write timeout for a single JSON-RPC round-trip. Generous — herdr answers
 /// in milliseconds; this only guards against a wedged host hanging the plugin.
@@ -126,16 +127,17 @@ impl Herdr {
 
     // ---- read methods -------------------------------------------------------
 
-    /// `workspace.list` — every open workspace.
-    pub fn workspace_list(&mut self) -> crate::Result<Vec<WorkspaceInfo>> {
-        let result = self.call("workspace.list", &json!({}))?;
-        Ok(serde_json::from_value::<WorkspaceListResult>(result)?.workspaces)
-    }
-
-    /// `pane.list` for one workspace.
-    pub fn pane_list(&mut self, workspace_id: &str) -> crate::Result<Vec<PaneInfo>> {
-        let result = self.call("pane.list", &json!({ "workspace_id": workspace_id }))?;
-        Ok(serde_json::from_value::<PaneListResult>(result)?.panes)
+    /// `session.snapshot` — every workspace and every pane in one atomic read.
+    ///
+    /// Replaces `workspace.list` + one `pane.list` per workspace. Those were
+    /// separate round trips over a session that keeps moving, so a workspace
+    /// closing between them answered `workspace_not_found` and failed the whole
+    /// enumeration. One call cannot tear that way, and it costs 1 round trip
+    /// instead of 1 + N. Pane order within a workspace is identical to
+    /// `pane.list`, which is what keeps "the first pane's cwd wins" meaningful.
+    pub fn session_snapshot(&mut self) -> crate::Result<SessionSnapshot> {
+        let result = self.call("session.snapshot", &json!({}))?;
+        Ok(serde_json::from_value::<SessionSnapshotResult>(result)?.snapshot)
     }
 
     /// `worktree.list` — errors when `workspace_id` is not a git repo. That error
@@ -358,7 +360,7 @@ mod tests {
 
     #[test]
     fn frames_request_as_one_json_line() {
-        let line = frame_request("id-1", "pane.list", &json!({ "workspace_id": "w1" }));
+        let line = frame_request("id-1", "worktree.list", &json!({ "workspace_id": "w1" }));
         assert!(line.ends_with('\n'));
         assert_eq!(
             line.matches('\n').count(),
@@ -368,13 +370,13 @@ mod tests {
 
         let v: Value = serde_json::from_str(line.trim()).unwrap();
         assert_eq!(v["id"], "id-1");
-        assert_eq!(v["method"], "pane.list");
+        assert_eq!(v["method"], "worktree.list");
         assert_eq!(v["params"]["workspace_id"], "w1");
     }
 
     #[test]
     fn frames_empty_params_as_object() {
-        let line = frame_request("x", "workspace.list", &json!({}));
+        let line = frame_request("x", "session.snapshot", &json!({}));
         let v: Value = serde_json::from_str(line.trim()).unwrap();
         // params must be present and an (empty) object, not null — the server's
         // adjacently-tagged Method enum requires the `params` field.
@@ -392,11 +394,12 @@ mod tests {
 
     #[test]
     fn parses_result_bearing_success() {
-        let result =
-            parse_envelope(r#"{"id":"1","result":{"type":"workspace_list","workspaces":[]}}"#)
-                .unwrap();
-        assert_eq!(result["type"], "workspace_list");
-        assert!(result["workspaces"].is_array());
+        let result = parse_envelope(
+            r#"{"id":"1","result":{"type":"session_snapshot","snapshot":{"workspaces":[]}}}"#,
+        )
+        .unwrap();
+        assert_eq!(result["type"], "session_snapshot");
+        assert!(result["snapshot"]["workspaces"].is_array());
     }
 
     #[test]

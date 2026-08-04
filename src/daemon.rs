@@ -43,6 +43,29 @@ pub const TOKEN_CONFLICT: &str = "git_conflict";
 /// shutdown/disable without needing to know which was active).
 pub const STATUS_TOKENS: [&str; 3] = [TOKEN_CLEAN, TOKEN_DIRTY, TOKEN_CONFLICT];
 
+/// Largest `ttl_ms` herdr accepts on `pane.report_metadata` /
+/// `workspace.report_metadata` (24h — `ttl_ms.maximum` in `herdr api schema`).
+/// Anything above it is rejected with `invalid_metadata_ttl`.
+const MAX_TTL_MS: u64 = 86_400_000;
+
+// The config bound and this cap live in different modules, so nothing stops a
+// later edit from raising one and silently reintroducing the rejected-push bug.
+// Tie them together at compile time: the longest cadence a user can configure
+// must still produce a TTL herdr will accept.
+const _: () = assert!(config::MAX_INTERVAL_SECONDS.saturating_mul(3_000) <= MAX_TTL_MS);
+
+/// TTL for one refresh: three cycles, so a status rides out a missed refresh but
+/// still self-clears shortly after the daemon dies.
+///
+/// [`config::MAX_INTERVAL_SECONDS`] already bounds the cadence so this cannot
+/// exceed [`MAX_TTL_MS`]; the saturating multiply and clamp keep that true for
+/// any caller, since overflowing or overshooting would make herdr reject every
+/// push with `invalid_metadata_ttl` — silently, because the daemon ignores push
+/// errors, leaving the sidebar blank with nothing to point at.
+fn status_ttl_ms(interval_seconds: u64) -> u64 {
+    interval_seconds.saturating_mul(3_000).min(MAX_TTL_MS)
+}
+
 /// The status token a non-empty status for `g` is pushed onto, chosen by
 /// [`git::severity`] so the colour matches the terminal dashboard's cell.
 fn status_token_name(g: &crate::model::GitStatus) -> &'static str {
@@ -265,7 +288,7 @@ fn space_status(sp: &Space, config: &Config) -> String {
 /// TTL'd metadata on the first spare (else agent) pane.
 pub fn push_statuses(client: &mut Herdr, spaces: &[Space], config: &Config, tracked: &mut Tracked) {
     let source = config::plugin_id();
-    let ttl_ms = config.interval_seconds * 1000 * 3;
+    let ttl_ms = status_ttl_ms(config.interval_seconds);
 
     for sp in spaces {
         let status = space_status(sp, config);
@@ -601,6 +624,24 @@ mod tests {
     fn non_repo_space_status_is_empty() {
         let sp = Space::default(); // is_repo = false
         assert!(space_status(&sp, &Config::default()).is_empty());
+    }
+
+    // ---- metadata TTL --------------------------------------------------------
+
+    #[test]
+    fn ttl_is_three_refresh_cycles() {
+        assert_eq!(status_ttl_ms(Config::default().interval_seconds), 15_000);
+        assert_eq!(status_ttl_ms(1), 3_000);
+        assert_eq!(status_ttl_ms(60), 180_000);
+    }
+
+    #[test]
+    fn ttl_is_clamped_to_the_herdr_maximum() {
+        // 28_800s * 3 lands exactly on herdr's cap; anything longer must clamp
+        // rather than be rejected as `invalid_metadata_ttl`.
+        assert_eq!(status_ttl_ms(28_800), MAX_TTL_MS);
+        assert_eq!(status_ttl_ms(28_801), MAX_TTL_MS);
+        assert_eq!(status_ttl_ms(u64::MAX), MAX_TTL_MS); // saturates, never wraps
     }
 
     // ---- restart recovery ---------------------------------------------------

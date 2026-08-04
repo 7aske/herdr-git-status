@@ -13,7 +13,12 @@
 
 id = "ez-corp.git-status"
 name = "Git Status"
-version = "1.4.0"
+version = "1.4.1"
+# Oldest herdr with every API this plugin calls: the `tokens` metadata API on
+# `pane.report_metadata` / `workspace.report_metadata`, and `pane.report_agent`
+# without `custom_status` — all 0.7.5. Diffing the two bundled API schemas
+# (`herdr api schema`, protocol 17 → 19) shows 0.8.0 changed none of the types
+# used here, so this stays put; developed and tested against 0.8.0.
 min_herdr_version = "0.7.5"
 description = "Git working-tree status (staged/modified/untracked, ✓ when clean) per space."
 platforms = ["linux", "macos"]

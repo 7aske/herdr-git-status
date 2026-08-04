@@ -17,10 +17,10 @@ committed and pushed.
     +2 ~1 ?3          ← spaces card (sidebar mode)
 ```
 
-Both modes work on **stock herdr 0.7.5+**; each needs a one-line addition to your
-herdr `config.toml` naming the plugin's tokens (see
-[Install](#install)). Severity is colour-coded — green `✓`, yellow for changes,
-red for conflicts — via a per-token `fg` you control.
+Both modes work on **stock herdr 0.7.5+** (verified end-to-end on 0.8.0); each
+needs a one-line addition to your herdr `config.toml` naming the plugin's tokens
+(see [Install](#install)). Severity is colour-coded — green `✓`, yellow for
+changes, red for conflicts — via a per-token `fg` you control.
 
 The status token is compact and only shows what's non-zero:
 
@@ -87,6 +87,12 @@ everything immediately. A space that becomes fully clean flips to `✓` on the
 next refresh; one whose status empties (e.g. clean but with commits left to
 push) has its row actively cleared.
 
+In agents-panel mode the TTL covers the status *text* only — herdr has no TTL for
+a reported agent, so the `git` row itself is released rather than expired. An
+updater that dies without running its shutdown (a `SIGKILL`, a power cut) leaves
+an empty `git` row behind until the next enable, disable, or herdr restart, each
+of which sweeps it. Sidebar mode is unaffected: its whole status is a token.
+
 The updater **survives herdr restarts**. Enabling it records that you want it;
 herdr then runs the manifest's `[[startup]]` hook (`--restore`) on every server
 start — including a live `herdr update --handoff` — which brings the daemon back
@@ -108,7 +114,9 @@ Configure in `$HERDR_PLUGIN_CONFIG_DIR/config.toml`
 mode = "agents-panel"       # default — token lands on the agents-panel row
 # mode = "sidebar"          # token lands on the spaces card (native on 0.7.5+)
 
-# Refresh cadence in seconds (>= 1). Default 5.
+# Refresh cadence in seconds (>= 1). Default 5. A status is pushed with a TTL of
+# three cycles, capped at herdr's 24h metadata maximum — so a very slow cadence
+# stays valid rather than having every push rejected.
 interval_seconds = 5
 
 # Show "✓" for fully clean repos (nothing to commit, push, or pull). Default
@@ -118,7 +126,11 @@ clean_checkmark = true
 
 - **agents-panel** (default): each space gets a `git` pseudo-agent entry in the
   sidebar agents panel, carrying the status token. Reference the `$git_*` tokens
-  under `[ui.sidebar.agents]`.
+  under `[ui.sidebar.agents]`. Note that a reported agent also gives its space an
+  agent status mark, and since **0.8.0** that mark is drawn identically in the
+  sidebar, the session navigator, and the mobile view — so a space whose only
+  "agent" is this plugin reads as idle in all three. Pick sidebar mode if you
+  want those marks to mean real agents only.
 - **sidebar**: reports the token on the *workspace*, so it renders inside each
   spaces card under the branch name. Reference the `$git_*` tokens under
   `[ui.sidebar.spaces]`. (The spaces card renders workspace tokens; a pane token
@@ -176,15 +188,26 @@ plugin's `$usage` token — both can render at once. Built-in `branch` /
 `git_status` (ahead/behind) tokens are native. Requires herdr ≥ 0.7.5 (the
 `tokens` metadata API); older builds need plugin v1.2.x.
 
+`min_herdr_version` stays **0.7.5**: that is still the oldest herdr with every
+API this plugin calls, and diffing herdr's own bundled API schemas (protocol 17
+→ 19) shows 0.8.0 changed none of the types used here. 0.8.0 is the version the
+plugin is developed and tested against — both modes, all three severity tokens,
+the TTL, restart recovery, and worktree grouping are exercised against it.
+
 ## How it works
 
-For each open workspace, the plugin reads the panes over the herdr socket, takes
-the first pane's cwd, and runs `git status --porcelain=v1 --branch` there. The
+The plugin reads every workspace and pane in one `session.snapshot` over the
+herdr socket, takes each space's first pane cwd, and runs
+`git status --porcelain=v1 --branch` there. The
 result is reduced to the token above and pushed as a TTL'd named metadata token,
 chosen by severity (`git_clean` / `git_dirty` / `git_conflict`) so herdr can
 colour it — onto the workspace in sidebar mode, or onto a pseudo-agent pane in
 agents-panel mode. It computes nothing from `/proc` and spawns no shells — just
 one `git` per space.
+
+The cwd is each pane's live shell cwd, so a space whose first pane has `cd`'d
+into a different repo reports *that* repo — while herdr's own `branch` row keeps
+naming the space's checkout. `cd` back and the next refresh agrees again.
 
 ## Development
 

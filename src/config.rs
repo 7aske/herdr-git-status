@@ -42,6 +42,16 @@ impl Default for Config {
 /// Default plugin id when herdr does not inject `HERDR_PLUGIN_ID`.
 const DEFAULT_PLUGIN_ID: &str = "ez-corp.git-status";
 
+/// Upper bound on `interval_seconds` (8 hours).
+///
+/// The updater pushes each status with a TTL of three intervals, and herdr
+/// rejects a metadata `ttl_ms` above 24h with `invalid_metadata_ttl` — so
+/// 3 × this must stay inside that window, and 8h × 3 = 24h exactly. Clamping
+/// the cadence rather than the TTL keeps the two in step: capping the TTL alone
+/// would let it fall below the refresh interval, blinking every status out
+/// between pushes.
+pub const MAX_INTERVAL_SECONDS: u64 = 28_800;
+
 /// Load the plugin's own `config.toml`, returning defaults if it is absent.
 pub fn load_config() -> Config {
     match std::fs::read_to_string(config_dir().join("config.toml")) {
@@ -132,11 +142,12 @@ fn parse_config(text: &str) -> Config {
             "clean_checkmark" if value == "false" => cfg.clean_checkmark = false,
             // Accept any numeric >= 1; the struct stores whole seconds, so a
             // fractional value is truncated (the daemon uses it as a coarse
-            // cadence).
+            // cadence). Clamped at [`MAX_INTERVAL_SECONDS`] so the derived TTL
+            // cannot exceed what herdr accepts.
             "interval_seconds" => {
                 if let Ok(n) = value.parse::<f64>() {
                     if n >= 1.0 {
-                        cfg.interval_seconds = n as u64;
+                        cfg.interval_seconds = (n as u64).min(MAX_INTERVAL_SECONDS);
                     }
                 }
             }
@@ -227,6 +238,20 @@ mod tests {
         assert_eq!(parse_config("interval_seconds = 0").interval_seconds, 5);
         assert_eq!(parse_config("interval_seconds = -3").interval_seconds, 5);
         assert_eq!(parse_config("interval_seconds = fast").interval_seconds, 5);
+    }
+
+    #[test]
+    fn config_interval_seconds_is_capped() {
+        // An absurd cadence would push the derived TTL (3 intervals) past the
+        // 24h maximum herdr accepts, and every status write would be rejected.
+        assert_eq!(
+            parse_config("interval_seconds = 28800").interval_seconds,
+            MAX_INTERVAL_SECONDS
+        );
+        assert_eq!(
+            parse_config("interval_seconds = 999999").interval_seconds,
+            MAX_INTERVAL_SECONDS
+        );
     }
 
     #[test]
