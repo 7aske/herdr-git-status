@@ -14,12 +14,13 @@ dependencies = [
 
 [[package]]
 name = "git-status"
-version = "1.4.1"
+version = "1.5.0"
 dependencies = [
  "libc",
  "serde",
  "serde_json",
  "signal-hook",
+ "windows-sys",
 ]
 
 [[package]]

@@ -8,7 +8,9 @@
 use std::io::{self, IsTerminal, Write};
 
 use serde::Serialize;
+#[cfg(unix)]
 use signal_hook::consts::{SIGINT, SIGTERM};
+#[cfg(unix)]
 use signal_hook::iterator::Signals;
 
 use crate::collect;
@@ -214,17 +216,11 @@ pub fn run_json(client: &mut Herdr) -> crate::Result<()> {
 
 /// `--interval`: live watch, redrawing every `interval_ms`.
 ///
-/// A background thread restores the cursor and exits on SIGINT/SIGTERM; the main
-/// loop hides the cursor, then clears + redraws each frame.
+/// An interrupt handler restores the cursor and exits on Ctrl+C (SIGINT/SIGTERM
+/// on Unix, a console ctrl event on Windows); the main loop hides the cursor,
+/// then clears + redraws each frame.
 pub fn run_interval(client: &mut Herdr, interval_ms: u64) -> crate::Result<()> {
-    let mut signals = Signals::new([SIGINT, SIGTERM])?;
-    std::thread::spawn(move || {
-        if signals.forever().next().is_some() {
-            print!("\x1b[?25h"); // show cursor
-            let _ = io::stdout().flush();
-            std::process::exit(0);
-        }
-    });
+    restore_cursor_on_interrupt()?;
 
     let mut out = io::stdout();
     write!(out, "\x1b[?25l")?; // hide cursor
@@ -246,7 +242,72 @@ pub fn run_interval(client: &mut Herdr, interval_ms: u64) -> crate::Result<()> {
     }
 }
 
+/// On the first interrupt, restore the cursor and exit — a quit live watch must
+/// not leave the pane cursorless. Unix delivery: a signal-hook thread on
+/// SIGINT/SIGTERM.
+#[cfg(unix)]
+fn restore_cursor_on_interrupt() -> crate::Result<()> {
+    let mut signals = Signals::new([SIGINT, SIGTERM])?;
+    std::thread::spawn(move || {
+        if signals.forever().next().is_some() {
+            show_cursor_and_exit();
+        }
+    });
+    Ok(())
+}
+
+/// Windows delivery of the same cleanup: a console ctrl handler (Ctrl+C,
+/// Ctrl+Break, console close) — there are no POSIX signals to hook.
+#[cfg(windows)]
+fn restore_cursor_on_interrupt() -> crate::Result<()> {
+    use windows_sys::core::BOOL;
+    use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
+
+    unsafe extern "system" fn handler(_ctrl_type: u32) -> BOOL {
+        show_cursor_and_exit()
+    }
+    // SAFETY: registers a handler that only writes to stdout and exits.
+    if unsafe { SetConsoleCtrlHandler(Some(handler), 1) } == 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
+/// Shared interrupt cleanup: show the cursor again and exit the watch.
+///
+/// Deliberately not `print!`: this runs inside a Win32 console-ctrl callback, and
+/// `print!` panics if stdout is gone — which, with `panic = "abort"`, would abort
+/// the process from across an FFI boundary rather than exit cleanly.
+fn show_cursor_and_exit() -> ! {
+    let mut out = io::stdout();
+    let _ = write!(out, "\x1b[?25h"); // show cursor
+    let _ = out.flush();
+    std::process::exit(0);
+}
+
+/// Opt the console into VT escape processing so the ANSI sequences above render
+/// on legacy conhost too — Windows Terminal and herdr's own panes have it on
+/// already. Best-effort: a redirected stdout has no console mode to set, and
+/// [`Style::detect`]'s TTY gate keeps that output plain anyway.
+#[cfg(windows)]
+pub fn enable_vt() {
+    use windows_sys::Win32::System::Console::{
+        GetConsoleMode, GetStdHandle, SetConsoleMode, CONSOLE_MODE,
+        ENABLE_VIRTUAL_TERMINAL_PROCESSING, STD_OUTPUT_HANDLE,
+    };
+    // SAFETY: queries/updates the mode of the process's own stdout handle; a
+    // failed `GetConsoleMode` (no console) leaves everything untouched.
+    unsafe {
+        let handle = GetStdHandle(STD_OUTPUT_HANDLE);
+        let mut mode: CONSOLE_MODE = 0;
+        if GetConsoleMode(handle, &mut mode) != 0 {
+            SetConsoleMode(handle, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+        }
+    }
+}
+
 /// Local wall-clock `HH:MM:SS` for the live-watch footer stamp.
+#[cfg(unix)]
 fn local_time_string() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let secs = SystemTime::now()
@@ -257,6 +318,18 @@ fn local_time_string() -> String {
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     unsafe { libc::localtime_r(&secs, &mut tm) };
     format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec)
+}
+
+/// Windows counterpart: `GetLocalTime` already answers in local time — no epoch
+/// arithmetic or `localtime_r` needed.
+#[cfg(windows)]
+fn local_time_string() -> String {
+    use windows_sys::Win32::Foundation::SYSTEMTIME;
+    use windows_sys::Win32::System::SystemInformation::GetLocalTime;
+    // SAFETY: `GetLocalTime` fills the caller-owned struct and cannot fail.
+    let mut st: SYSTEMTIME = unsafe { std::mem::zeroed() };
+    unsafe { GetLocalTime(&mut st) };
+    format!("{:02}:{:02}:{:02}", st.wHour, st.wMinute, st.wSecond)
 }
 
 #[cfg(test)]

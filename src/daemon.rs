@@ -7,12 +7,14 @@
 //! (nothing to commit, push, or pull) reports `✓` unless `clean_checkmark =
 //! false`; a space with an empty status (non-repo, or clean-but-diverged) has
 //! any previous status actively cleared so no stale row lingers. `enable` /
-//! `disable` / `toggle` spawn or signal that daemon and sweep leftover statuses,
+//! `disable` / `toggle` spawn or stop that daemon and sweep leftover statuses,
 //! and `restore` (herdr's `[[startup]]` hook) brings it back after a herdr or
 //! machine restart when an `enabled` marker alongside the pid file says it was
-//! wanted.
+//! wanted. The stop request travels as SIGTERM on Unix and as a stop-marker
+//! file the daemon polls on Windows, which has no signal to deliver.
 
 use std::collections::{HashMap, HashSet};
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,7 +22,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+#[cfg(unix)]
 use signal_hook::consts::{SIGINT, SIGTERM};
+#[cfg(unix)]
 use signal_hook::iterator::Signals;
 
 use crate::collect::{self, PSEUDO_AGENT};
@@ -93,31 +97,64 @@ pub struct Tracked {
 /// PID of a live updater daemon, or `None` (missing pid file / dead process /
 /// a pid that no longer belongs to us).
 ///
-/// Reads `<state_dir>/updater.pid`, probes the process with `kill(pid, 0)`
-/// (signal 0 checks existence only), and then confirms the pid really is one of
-/// our processes. That last check matters: the state dir outlives reboots, so an
-/// unclean shutdown can leave a pid file pointing at a pid the kernel later
-/// recycled for something else — and without it `--enable` would no-op forever
-/// against that impostor, leaving the sidebar permanently blank.
+/// Reads `<state_dir>/updater.pid`, probes the process for liveness
+/// ([`pid_alive`]), and then confirms the pid really is one of our processes.
+/// That last check matters: the state dir outlives reboots, so an unclean
+/// shutdown can leave a pid file pointing at a pid the kernel later recycled
+/// for something else — and without it `--enable` would no-op forever against
+/// that impostor, leaving the sidebar permanently blank.
 pub fn daemon_pid() -> Option<u32> {
     let text = std::fs::read_to_string(config::pid_file()).ok()?;
     let pid: i32 = text.trim().parse().ok()?;
     if pid <= 0 {
         return None;
     }
-    // SAFETY: `kill` with signal 0 performs no delivery, only a liveness probe.
-    if unsafe { libc::kill(pid, 0) } != 0 {
+    if !pid_alive(pid) {
         return None;
     }
     is_our_process(pid as u32).then_some(pid as u32)
 }
 
-/// `--daemon`: run the updater loop until signalled, then clear and exit.
+/// Whether a process with `pid` currently exists — a probe with no delivery or
+/// side effects.
+#[cfg(unix)]
+fn pid_alive(pid: i32) -> bool {
+    // SAFETY: `kill` with signal 0 performs no delivery, only a liveness probe.
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+/// Windows liveness probe: open the process and check it has not exited.
 ///
-/// Single-instance via the pid file; a signal-hook thread performs the SIGINT/
-/// SIGTERM shutdown (clear tracked statuses, unlink pid, `exit(0)`) over its own
-/// socket connection so it need not wait on the main loop's sleep. The loop
-/// shuts down after five consecutive failures (herdr server likely gone).
+/// `OpenProcess` alone is not enough — a pid whose process just exited can stay
+/// openable while anything still holds a handle — so the exit code is compared
+/// against `STILL_ACTIVE` too.
+#[cfg(windows)]
+fn pid_alive(pid: i32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    // SAFETY: probes a handle we open and close ourselves; no memory is shared.
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid as u32);
+        if handle.is_null() {
+            return false;
+        }
+        let mut code: u32 = 0;
+        let alive = GetExitCodeProcess(handle, &mut code) != 0 && code == STILL_ACTIVE as u32;
+        CloseHandle(handle);
+        alive
+    }
+}
+
+/// `--daemon`: run the updater loop until asked to stop, then clear and exit.
+///
+/// Single-instance via the pid file; a watcher thread performs the shutdown
+/// (clear tracked statuses, unlink pid, `exit(0)`) over its own socket
+/// connection so it need not wait on the main loop's sleep. The stop request it
+/// watches for is SIGINT/SIGTERM on Unix and the [`config::stop_flag`] marker
+/// file on Windows. The loop shuts down after five consecutive failures (herdr
+/// server likely gone).
 pub fn run_daemon() -> crate::Result<()> {
     if daemon_pid().is_some() {
         return Ok(()); // another updater is already live
@@ -140,17 +177,36 @@ pub fn run_daemon() -> crate::Result<()> {
     let stopping = Arc::new(AtomicBool::new(false));
     let tracked = Arc::new(Mutex::new(Tracked::default()));
 
-    // Signal thread: on the first SIGINT/SIGTERM, win the shutdown race and clear
+    // Watcher thread: on the first stop request, win the shutdown race and clear
     // everything via a fresh connection, then exit. The main loop must not
     // re-report after this runs, so it parks once it observes `stopping`.
-    let mut signals = Signals::new([SIGINT, SIGTERM])?;
+    #[cfg(unix)]
     {
+        let mut signals = Signals::new([SIGINT, SIGTERM])?;
         let stopping = Arc::clone(&stopping);
         let tracked = Arc::clone(&tracked);
         thread::spawn(move || {
             if signals.forever().next().is_some() && !stopping.swap(true, Ordering::SeqCst) {
                 shutdown(herdr::connect().ok().as_mut(), &tracked);
             }
+        });
+    }
+    // Windows has no signal to wait on: `--disable` drops a stop-marker file in
+    // the state dir instead, and this watcher polls for it once a second — same
+    // shutdown, different delivery. The marker is consumed before shutting down
+    // so a later daemon does not trip over it.
+    #[cfg(windows)]
+    {
+        let stopping = Arc::clone(&stopping);
+        let tracked = Arc::clone(&tracked);
+        thread::spawn(move || loop {
+            if config::stop_flag().exists() {
+                let _ = std::fs::remove_file(config::stop_flag());
+                if !stopping.swap(true, Ordering::SeqCst) {
+                    shutdown(herdr::connect().ok().as_mut(), &tracked);
+                }
+            }
+            thread::sleep(Duration::from_secs(1));
         });
     }
 
@@ -222,10 +278,8 @@ pub fn disable_updater() -> crate::Result<()> {
 
     if let Some(pid) = daemon_pid() {
         // The daemon clears its own statuses on shutdown; best-effort.
-        // SAFETY: `kill` merely posts SIGTERM to the pid; failure is ignored.
-        unsafe {
-            libc::kill(pid as i32, SIGTERM);
-        }
+        request_daemon_stop(pid);
+        await_daemon_exit();
     }
 
     // Belt and braces: sweep every current pane in case the daemon died — release
@@ -419,11 +473,54 @@ fn clear_stale_workspace_token(
 
 // ---- helpers ----------------------------------------------------------------
 
+/// Ask a live daemon to shut down.
+///
+/// Unix: post SIGTERM; the daemon's signal thread runs the shutdown. Windows:
+/// drop the stop-marker file its watcher thread polls (~1s latency) — there is
+/// no signal to send.
+#[cfg(unix)]
+fn request_daemon_stop(pid: u32) {
+    // SAFETY: `kill` merely posts SIGTERM to the pid; failure is ignored.
+    unsafe {
+        libc::kill(pid as i32, SIGTERM);
+    }
+}
+
+/// Windows delivery of [`request_daemon_stop`]: the stop-marker file.
+#[cfg(windows)]
+fn request_daemon_stop(_pid: u32) {
+    let stop = config::stop_flag();
+    if let Some(dir) = stop.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(stop, "1\n");
+}
+
+/// Wait (briefly) for a stopping daemon to actually be gone.
+///
+/// [`request_daemon_stop`] only *posts* the request: the pid file lives until the
+/// daemon has finished clearing its statuses and unlinked it. An `--enable` — or
+/// a second `--toggle` — landing inside that window sees a live pid, reports
+/// "already enabled", and spawns nothing; moments later the old daemon exits,
+/// leaving the updater marked wanted but not running, and the sidebar blank until
+/// the next herdr restart. Windows widens the window to its watcher's ~1s poll,
+/// so wait it out. Bounded: a daemon that never exits (host wedged mid-clear)
+/// must not hang the disable the user asked for.
+fn await_daemon_exit() {
+    for _ in 0..30 {
+        if daemon_pid().is_none() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
 /// Re-exec ourselves as a detached `--daemon` process.
 ///
-/// Fully detached: a new session (setsid) so it survives the controlling
-/// terminal — which is what lets the daemon outlive the short-lived `--enable` /
-/// `--restore` command herdr spawned it from — and null stdio.
+/// Fully detached — which is what lets the daemon outlive the short-lived
+/// `--enable` / `--restore` command herdr spawned it from — with null stdio.
+/// Detachment is a new session (setsid) on Unix and [`spawn_detached`]'s
+/// creation flags on Windows.
 fn spawn_daemon() -> crate::Result<()> {
     let exe = std::env::current_exe()?;
     let mut cmd = Command::new(exe);
@@ -431,6 +528,11 @@ fn spawn_daemon() -> crate::Result<()> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    spawn_detached(cmd)
+}
+
+#[cfg(unix)]
+fn spawn_detached(mut cmd: Command) -> crate::Result<()> {
     // SAFETY: `setsid` is async-signal-safe and the only action taken in the
     // forked child before exec; it starts a new session, detaching the daemon.
     unsafe {
@@ -441,6 +543,30 @@ fn spawn_daemon() -> crate::Result<()> {
     }
     cmd.spawn()?; // do not wait — the child outlives us and is reaped by init
     Ok(())
+}
+
+#[cfg(windows)]
+fn spawn_detached(mut cmd: Command) -> crate::Result<()> {
+    use std::os::windows::process::CommandExt;
+    use windows_sys::Win32::System::Threading::{
+        CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS,
+    };
+
+    // A stale stop marker from an earlier `--disable` must not fell the fresh
+    // daemon the moment its watcher starts polling. Removed BEFORE the spawn so
+    // a disable that lands after this still wins.
+    let _ = std::fs::remove_file(config::stop_flag());
+
+    // No console, own process group (a Ctrl+C aimed at the parent never reaches
+    // it), and — should herdr run plugin commands inside a kill-on-close job
+    // object — break away from that job so the daemon outlives the enable
+    // command. Breakaway is *refused* by jobs that forbid it, so fall back to
+    // plain detachment rather than failing the enable.
+    let detached = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP;
+    cmd.creation_flags(detached | CREATE_BREAKAWAY_FROM_JOB)
+        .spawn()
+        .or_else(|_| cmd.creation_flags(detached).spawn())?;
+    Ok(()) // do not wait — the child outlives us
 }
 
 /// Create (`true`) or remove (`false`) the "updater wanted" marker at `path`.
@@ -480,9 +606,61 @@ fn is_our_process(pid: u32) -> bool {
     }
 }
 
-/// macOS has no `/proc`, so the pid-reuse guard degrades to the `kill(pid, 0)`
-/// liveness probe alone — the behaviour this plugin has always had there.
-#[cfg(not(target_os = "linux"))]
+/// Windows has no `/proc`, but it can answer the same question directly: compare
+/// the process's image path against our own.
+///
+/// Worth doing rather than degrading to the liveness probe (as macOS does),
+/// because Windows recycles pids aggressively and the failure is a dead end —
+/// a recycled pid makes `--enable` and `--restore` no-op forever AND leaves a
+/// stop marker nothing ever consumes, so the sidebar stays blank with no way out
+/// short of deleting the state dir by hand. Anything unreadable — a vanished
+/// process, or one owned by another user — reads as "not ours", the safe answer:
+/// we treat the updater as down and start a fresh one.
+#[cfg(windows)]
+fn is_our_process(pid: u32) -> bool {
+    match (image_path_of(pid), std::env::current_exe().ok()) {
+        // Windows paths are case-insensitive, and the two APIs need not agree on
+        // casing, so a case-sensitive compare would report our own daemon as an
+        // impostor and start a second one.
+        (Some(theirs), Some(ours)) => theirs
+            .as_os_str()
+            .as_encoded_bytes()
+            .eq_ignore_ascii_case(ours.as_os_str().as_encoded_bytes()),
+        _ => false,
+    }
+}
+
+/// Full image path of `pid`, or `None` if it cannot be read.
+#[cfg(windows)]
+fn image_path_of(pid: u32) -> Option<std::path::PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    // `QueryFullProcessImageNameW` is not bounded by MAX_PATH; size for the
+    // extended limit so a deep install path cannot make us misjudge the pid.
+    let mut buf = vec![0u16; 32_768];
+    let mut len = buf.len() as u32;
+    // SAFETY: opens, queries, and closes a handle we own; the API writes at most
+    // `len` UTF-16 units into `buf` and updates `len` with what it wrote.
+    let written = unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return None;
+        }
+        let ok = QueryFullProcessImageNameW(handle, 0, buf.as_mut_ptr(), &mut len);
+        CloseHandle(handle);
+        (ok != 0).then_some(len as usize)?
+    };
+    Some(std::ffi::OsString::from_wide(&buf[..written]).into())
+}
+
+/// macOS has no `/proc` and no cheap image-path query, so the pid-reuse guard
+/// degrades to the [`pid_alive`] liveness probe alone — the behaviour this plugin
+/// has always had there.
+#[cfg(not(any(target_os = "linux", windows)))]
 fn is_our_process(_pid: u32) -> bool {
     true
 }

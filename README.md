@@ -42,8 +42,9 @@ the branch row, so the status row stays focused on the work tree.
 - **Worktree-aware**: worktree-child workspaces (rendered as single-row indented
   sidebar entries) are skipped rather than mislabelled
 - A live dashboard pane and one-shot report/JSON actions
-- A small static Rust binary that talks to herdr over its unix socket — one
-  `git` invocation per space per refresh, no Node runtime
+- A small static Rust binary that talks to herdr over its local socket — one
+  `git` invocation per space per refresh, no Node runtime. Works on Linux,
+  macOS, and Windows (where herdr serves the same protocol over a named pipe)
 - Read-only: uses `git --no-optional-locks status`, so it never contends with
   your own git commands for the index lock
 
@@ -56,7 +57,10 @@ herdr plugin install ezcorp-org/herdr-git-status
 Requirements: `git` and the **Rust toolchain** (`cargo`) on the box hosting the
 herdr server — herdr compiles the plugin at install time via
 `cargo build --release`. Plugins run on the machine hosting the herdr server, so
-remote setups need these on the server box only.
+remote setups need these on the server box only. All three herdr platforms are
+supported: Linux, macOS, and Windows (since plugin 1.5.0; on Windows the plugin
+talks to herdr over its named pipe, and the updater is stopped via a state-dir
+marker file instead of SIGTERM — behaviour is otherwise identical).
 
 **One required step on herdr 0.7.5+**: the status rides a *named metadata token*,
 and herdr only draws tokens its sidebar config asks for. herdr's default rows do

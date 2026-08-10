@@ -94,6 +94,15 @@ pub fn enabled_flag() -> PathBuf {
     state_dir().join("enabled")
 }
 
+/// Stop marker asking a running daemon to shut down (`<state_dir>/stop`).
+///
+/// Windows has no SIGTERM to post, so `--disable` writes this file instead and
+/// the daemon's watcher thread polls for it (removing it) once a second.
+#[cfg(windows)]
+pub fn stop_flag() -> PathBuf {
+    state_dir().join("stop")
+}
+
 // ---- env / path resolution --------------------------------------------------
 
 /// Read `name` from the environment, treating unset AND empty as absent.
@@ -104,18 +113,43 @@ pub(crate) fn non_empty_env(name: &str) -> Option<String> {
     }
 }
 
-/// User home directory from `$HOME`, or an empty path when unset.
+/// User home directory from `$HOME` — or `$USERPROFILE` on Windows, where `HOME`
+/// is not a thing — or an empty path when neither is set.
 fn home_dir() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_default()
+    let home = std::env::var_os("HOME");
+    #[cfg(windows)]
+    let home = home.or_else(|| std::env::var_os("USERPROFILE"));
+    home.map(PathBuf::from).unwrap_or_default()
 }
 
 /// XDG config base: `$XDG_CONFIG_HOME` if set (and non-empty), else `~/.config`.
-pub(crate) fn config_home() -> PathBuf {
+#[cfg(not(windows))]
+fn config_home() -> PathBuf {
     non_empty_env("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| home_dir().join(".config"))
+}
+
+/// herdr's own directory — where its socket (Windows: the socket *marker* whose
+/// path names the pipe) lives: `<config_home>/herdr`.
+#[cfg(not(windows))]
+pub(crate) fn herdr_dir() -> PathBuf {
+    config_home().join("herdr")
+}
+
+/// Windows counterpart: herdr keeps its socket under `%APPDATA%` (observed:
+/// `C:\Users\<u>\AppData\Roaming\herdr\herdr.sock`), NOT in `~/.config`, which
+/// does not exist there at all.
+///
+/// herdr injects `HERDR_SOCKET_PATH` for the commands it runs, so this fallback
+/// only matters when the binary is invoked by hand — but resolving to a path
+/// that can never exist turns that into a baffling "cannot connect" instead.
+#[cfg(windows)]
+pub(crate) fn herdr_dir() -> PathBuf {
+    non_empty_env("APPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home_dir().join("AppData").join("Roaming"))
+        .join("herdr")
 }
 
 // ---- pure parser (hand-rolled, no `toml` crate) -----------------------------

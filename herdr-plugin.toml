@@ -13,7 +13,7 @@
 
 id = "ez-corp.git-status"
 name = "Git Status"
-version = "1.4.1"
+version = "1.5.0"
 # Oldest herdr with every API this plugin calls: the `tokens` metadata API on
 # `pane.report_metadata` / `workspace.report_metadata`, and `pane.report_agent`
 # without `custom_status` — all 0.7.5. Diffing the two bundled API schemas
@@ -21,7 +21,11 @@ version = "1.4.1"
 # used here, so this stays put; developed and tested against 0.8.0.
 min_herdr_version = "0.7.5"
 description = "Git working-tree status (staged/modified/untracked, ✓ when clean) per space."
-platforms = ["linux", "macos"]
+# Windows works since 1.5.0: herdr's Windows build serves its socket protocol
+# over a named pipe (`\\.\pipe\<socket path>`), which the client opens via std,
+# and the daemon's signal/setsid plumbing has Win32 equivalents (stop-marker
+# file / detached process) behind cfg gates.
+platforms = ["linux", "macos", "windows"]
 
 # Commands are argv arrays (no shell) and run with the plugin dir as cwd,
 # per https://herdr.dev/docs/plugins/#trust-and-security

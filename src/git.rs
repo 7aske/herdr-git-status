@@ -24,19 +24,27 @@ pub fn status(cwd: Option<&str>) -> GitStatus {
     };
     // `--no-optional-locks` keeps this read-only probe from taking the index
     // lock (so it never contends with the user's own git commands).
-    let output = Command::new("git")
-        .args([
-            "-C",
-            cwd,
-            "--no-optional-locks",
-            "status",
-            "--porcelain=v1",
-            "--branch",
-            "--untracked-files=normal",
-        ])
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output();
+    let mut cmd = Command::new("git");
+    cmd.args([
+        "-C",
+        cwd,
+        "--no-optional-locks",
+        "status",
+        "--porcelain=v1",
+        "--branch",
+        "--untracked-files=normal",
+    ])
+    .stdin(Stdio::null())
+    .stderr(Stdio::null());
+    // The updater daemon has no console, so without this every `git.exe` it
+    // spawns would be given its own console WINDOW — flashing on the user's
+    // screen once per space per refresh.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
+    }
+    let output = cmd.output();
     match output {
         Ok(out) if out.status.success() => parse_porcelain(&String::from_utf8_lossy(&out.stdout)),
         _ => GitStatus::default(),

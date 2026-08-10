@@ -46,6 +46,10 @@ fn main() {
 }
 
 fn run() -> Result<()> {
+    // Windows consoles need an explicit opt-in before ANSI escapes render.
+    #[cfg(windows)]
+    render::enable_vt();
+
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     // Daemon / control modes manage their own socket connection internally.

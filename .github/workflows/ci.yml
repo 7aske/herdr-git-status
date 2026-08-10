@@ -9,7 +9,13 @@ env:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    strategy:
+      # Report both platforms: a Linux failure must not cancel the Windows leg
+      # (and vice versa) — that hides half the matrix on every red build.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
