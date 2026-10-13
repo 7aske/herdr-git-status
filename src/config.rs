@@ -18,6 +18,37 @@ pub enum Mode {
     Sidebar,
 }
 
+/// Glyphs used in the compact sidebar status token.
+///
+/// Override any of these in `config.toml` (`icon_staged`, `icon_modified`,
+/// `icon_untracked`, `icon_conflict`, `icon_clean`). Empty values are ignored
+/// and keep the default.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Icons {
+    /// Staged (index) changes. Default `+`.
+    pub staged: String,
+    /// Unstaged worktree modifications. Default `~`.
+    pub modified: String,
+    /// Untracked files. Default `?`.
+    pub untracked: String,
+    /// Conflicted / unmerged paths. Default `!`.
+    pub conflict: String,
+    /// Fully clean repo mark. Default `✓`.
+    pub clean: String,
+}
+
+impl Default for Icons {
+    fn default() -> Self {
+        Self {
+            staged: "+".to_string(),
+            modified: "~".to_string(),
+            untracked: "?".to_string(),
+            conflict: "!".to_string(),
+            clean: "✓".to_string(),
+        }
+    }
+}
+
 /// Plugin user config from `$HERDR_PLUGIN_CONFIG_DIR/config.toml`.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -27,6 +58,8 @@ pub struct Config {
     /// instead of clearing the status. `false` restores the pre-1.1 behaviour
     /// where a clean space shows nothing at all.
     pub clean_checkmark: bool,
+    /// Glyphs for staged / modified / untracked / conflict / clean marks.
+    pub icons: Icons,
 }
 
 impl Default for Config {
@@ -35,6 +68,7 @@ impl Default for Config {
             mode: Mode::AgentsPanel,
             interval_seconds: 5,
             clean_checkmark: true,
+            icons: Icons::default(),
         }
     }
 }
@@ -158,8 +192,9 @@ pub(crate) fn herdr_dir() -> PathBuf {
 /// the documented defaults.
 ///
 /// Recognised keys: `mode` (`agents-panel` | `sidebar`), `interval_seconds`
-/// (numeric `>= 1`), and `clean_checkmark` (`true` | `false`). Unknown keys are
-/// ignored.
+/// (numeric `>= 1`), `clean_checkmark` (`true` | `false`), and `icon_*`
+/// (`icon_staged` / `icon_modified` / `icon_untracked` / `icon_conflict` /
+/// `icon_clean`). Unknown keys are ignored.
 fn parse_config(text: &str) -> Config {
     let mut cfg = Config::default();
     for line in text.split('\n') {
@@ -185,6 +220,11 @@ fn parse_config(text: &str) -> Config {
                     }
                 }
             }
+            "icon_staged" if !value.is_empty() => cfg.icons.staged = value.to_string(),
+            "icon_modified" if !value.is_empty() => cfg.icons.modified = value.to_string(),
+            "icon_untracked" if !value.is_empty() => cfg.icons.untracked = value.to_string(),
+            "icon_conflict" if !value.is_empty() => cfg.icons.conflict = value.to_string(),
+            "icon_clean" if !value.is_empty() => cfg.icons.clean = value.to_string(),
             _ => {}
         }
     }
@@ -322,4 +362,23 @@ mod tests {
         assert_eq!(parse_kv_line("noeq"), None); // no '='
         assert_eq!(parse_kv_line("mode =   "), None); // empty value
     }
+
+    #[test]
+    fn config_icons_override_defaults() {
+        let cfg = parse_config(
+            "icon_staged = *\nicon_modified = M\nicon_untracked = U\nicon_conflict = X\nicon_clean = ok\n",
+        );
+        assert_eq!(cfg.icons.staged, "*");
+        assert_eq!(cfg.icons.modified, "M");
+        assert_eq!(cfg.icons.untracked, "U");
+        assert_eq!(cfg.icons.conflict, "X");
+        assert_eq!(cfg.icons.clean, "ok");
+    }
+
+    #[test]
+    fn config_empty_icon_keeps_default() {
+        let cfg = parse_config("icon_modified = \"\"");
+        assert_eq!(cfg.icons.modified, "~");
+    }
+
 }

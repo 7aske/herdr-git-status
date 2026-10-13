@@ -12,6 +12,7 @@
 
 use std::process::{Command, Stdio};
 
+use crate::config::Icons;
 use crate::model::GitStatus;
 
 /// Run `git status` in `cwd` and summarise it. A missing/empty cwd, a non-repo
@@ -82,33 +83,33 @@ pub fn severity(g: &GitStatus) -> Severity {
 }
 
 /// The status string the updater surfaces for a space: [`token`] for a dirty
-/// tree, [`CLEAN_MARK`] for a fully clean repo, and `""` otherwise (non-repo, or
-/// clean-but-diverged — the ahead/behind arrows are herdr's branch row's job).
-pub fn status_token(g: &GitStatus) -> String {
+/// tree, [`Icons::clean`] for a fully clean repo, and `""` otherwise (non-repo, or
+/// clean-but-diverged - the ahead/behind arrows are herdr's branch row's job).
+pub fn status_token(g: &GitStatus, icons: &Icons) -> String {
     if g.is_fully_clean() {
-        return CLEAN_MARK.to_string();
+        return icons.clean.clone();
     }
-    token(g)
+    token(g, icons)
 }
 
-/// The compact sidebar token: `"+<s> ~<m> ?<u> !<c>"` with zero parts omitted.
-/// Returns `""` for a clean (or non-repo) tree so the sidebar shows no row.
-pub fn token(g: &GitStatus) -> String {
+/// The compact sidebar token: `"<staged><s> <modified><m> ..."` with zero parts
+/// omitted. Returns `""` for a clean (or non-repo) tree so the sidebar shows no row.
+pub fn token(g: &GitStatus, icons: &Icons) -> String {
     if g.is_clean() {
         return String::new();
     }
     let mut parts = Vec::with_capacity(4);
     if g.staged > 0 {
-        parts.push(format!("+{}", g.staged));
+        parts.push(format!("{}{}", icons.staged, g.staged));
     }
     if g.modified > 0 {
-        parts.push(format!("~{}", g.modified));
+        parts.push(format!("{}{}", icons.modified, g.modified));
     }
     if g.untracked > 0 {
-        parts.push(format!("?{}", g.untracked));
+        parts.push(format!("{}{}", icons.untracked, g.untracked));
     }
     if g.conflicts > 0 {
-        parts.push(format!("!{}", g.conflicts));
+        parts.push(format!("{}{}", icons.conflict, g.conflicts));
     }
     parts.join(" ")
 }
@@ -301,7 +302,7 @@ mod tests {
         let g = parse_porcelain("## main...origin/main\n");
         assert!(g.is_repo);
         assert!(g.is_clean());
-        assert_eq!(token(&g), "");
+        assert_eq!(token(&g, &Icons::default()), "");
     }
 
     #[test]
@@ -323,7 +324,7 @@ mod tests {
             untracked: 3,
             ..GitStatus::default()
         };
-        assert_eq!(token(&g), "+2 ~1 ?3");
+        assert_eq!(token(&g, &Icons::default()), "+2 ~1 ?3");
     }
 
     #[test]
@@ -333,7 +334,7 @@ mod tests {
             modified: 4,
             ..GitStatus::default()
         };
-        assert_eq!(token(&g), "~4");
+        assert_eq!(token(&g, &Icons::default()), "~4");
     }
 
     #[test]
@@ -344,19 +345,47 @@ mod tests {
             conflicts: 2,
             ..GitStatus::default()
         };
-        assert_eq!(token(&g), "+1 !2");
+        assert_eq!(token(&g, &Icons::default()), "+1 !2");
     }
 
     #[test]
     fn token_empty_for_non_repo_and_clean() {
-        assert_eq!(token(&GitStatus::default()), ""); // non-repo
+        let icons = Icons::default();
+        assert_eq!(token(&GitStatus::default(), &icons), ""); // non-repo
         assert_eq!(
-            token(&GitStatus {
-                is_repo: true,
-                ..GitStatus::default()
-            }),
+            token(
+                &GitStatus {
+                    is_repo: true,
+                    ..GitStatus::default()
+                },
+                &icons,
+            ),
             "",
         );
+    }
+
+    #[test]
+    fn token_uses_custom_icons() {
+        let icons = Icons {
+            staged: "*".into(),
+            modified: "M".into(),
+            untracked: "U".into(),
+            conflict: "X".into(),
+            clean: "ok".into(),
+        };
+        let g = GitStatus {
+            is_repo: true,
+            staged: 2,
+            modified: 1,
+            untracked: 3,
+            ..GitStatus::default()
+        };
+        assert_eq!(token(&g, &icons), "*2 M1 U3");
+        let clean = GitStatus {
+            is_repo: true,
+            ..GitStatus::default()
+        };
+        assert_eq!(status_token(&clean, &icons), "ok");
     }
 
     // ---- status_token (what the updater pushes) -------------------------------
@@ -368,7 +397,7 @@ mod tests {
             ..GitStatus::default()
         };
         assert!(g.is_fully_clean());
-        assert_eq!(status_token(&g), CLEAN_MARK);
+        assert_eq!(status_token(&g, &Icons::default()), CLEAN_MARK);
     }
 
     #[test]
@@ -377,7 +406,7 @@ mod tests {
         // to vouch for — it must NOT read as "fully clean".
         let g = GitStatus::default();
         assert!(!g.is_fully_clean());
-        assert_eq!(status_token(&g), "");
+        assert_eq!(status_token(&g, &Icons::default()), "");
     }
 
     #[test]
@@ -391,7 +420,7 @@ mod tests {
                 behind,
                 ..GitStatus::default()
             };
-            assert_eq!(status_token(&g), "", "ahead={ahead} behind={behind}");
+            assert_eq!(status_token(&g, &Icons::default()), "", "ahead={ahead} behind={behind}");
         }
     }
 
@@ -403,8 +432,8 @@ mod tests {
             untracked: 1,
             ..GitStatus::default()
         };
-        assert_eq!(status_token(&g), token(&g));
-        assert_eq!(status_token(&g), "+2 ?1");
+        assert_eq!(status_token(&g, &Icons::default()), token(&g, &Icons::default()));
+        assert_eq!(status_token(&g, &Icons::default()), "+2 ?1");
     }
 
     // ---- severity classification ---------------------------------------------

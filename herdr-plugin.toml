@@ -13,7 +13,7 @@
 
 id = "ez-corp.git-status"
 name = "Git Status"
-version = "1.5.0"
+version = "1.6.0"
 # Oldest herdr with every API this plugin calls: the `tokens` metadata API on
 # `pane.report_metadata` / `workspace.report_metadata`, and `pane.report_agent`
 # without `custom_status` — all 0.7.5. Diffing the two bundled API schemas

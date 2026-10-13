@@ -115,17 +115,24 @@ Configure in `$HERDR_PLUGIN_CONFIG_DIR/config.toml`
 (herdr prints the config dir via `herdr plugin config-dir ez-corp.git-status`):
 
 ```toml
-mode = "agents-panel"       # default — token lands on the agents-panel row
+mode = "agents-panel"       # default - token lands on the agents-panel row
 # mode = "sidebar"          # token lands on the spaces card (native on 0.7.5+)
 
 # Refresh cadence in seconds (>= 1). Default 5. A status is pushed with a TTL of
-# three cycles, capped at herdr's 24h metadata maximum — so a very slow cadence
+# three cycles, capped at herdr's 24h metadata maximum - so a very slow cadence
 # stays valid rather than having every push rejected.
 interval_seconds = 5
 
 # Show "✓" for fully clean repos (nothing to commit, push, or pull). Default
 # true; false shows nothing for clean repos, so only dirty spaces claim a row.
 clean_checkmark = true
+
+# Optional glyphs for the compact status token (defaults shown).
+# icon_staged = "+"
+# icon_modified = "~"
+# icon_untracked = "?"
+# icon_conflict = "!"
+# icon_clean = "✓"
 ```
 
 - **agents-panel** (default): each space gets a `git` pseudo-agent entry in the

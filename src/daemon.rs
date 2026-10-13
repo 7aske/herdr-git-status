@@ -320,9 +320,9 @@ pub fn toggle_updater() -> crate::Result<()> {
 /// `clean_checkmark = false`, which restores the dirty-token-only behaviour.
 fn space_status(sp: &Space, config: &Config) -> String {
     if config.clean_checkmark {
-        git::status_token(&sp.git)
+        git::status_token(&sp.git, &config.icons)
     } else {
-        git::token(&sp.git)
+        git::token(&sp.git, &config.icons)
     }
 }
 

@@ -14,6 +14,7 @@ use signal_hook::consts::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
 
 use crate::collect;
+use crate::config::Icons;
 use crate::git;
 use crate::herdr::Herdr;
 use crate::model::{GitStatus, Space};
@@ -87,11 +88,11 @@ fn branch_display(g: &GitStatus) -> String {
 /// Status cell text: [`git::status_token`] (compact token, or `"✓"` for a fully
 /// clean repo), spelled out as `"clean"` for a clean-but-diverged tree — where
 /// the updater pushes nothing — and `"—"` when the space isn't a git repo.
-fn status_cell(g: &GitStatus) -> String {
+fn status_cell(g: &GitStatus, icons: &Icons) -> String {
     if !g.is_repo {
         return "—".to_string();
     }
-    let token = git::status_token(g);
+    let token = git::status_token(g, icons);
     if token.is_empty() {
         "clean".to_string()
     } else {
@@ -103,12 +104,13 @@ fn status_cell(g: &GitStatus) -> String {
 
 /// Format the per-space git-status report as a coloured, multi-line string.
 pub fn render(spaces: &[Space]) -> String {
-    render_styled(spaces, &Style::detect())
+    let icons = crate::config::load_config().icons;
+    render_styled(spaces, &Style::detect(), &icons)
 }
 
 /// Colour-parametrised body of [`render`] (split out so tests can force a
 /// deterministic no-colour rendering).
-fn render_styled(spaces: &[Space], style: &Style) -> String {
+fn render_styled(spaces: &[Space], style: &Style, icons: &Icons) -> String {
     let mut lines: Vec<String> = vec![style.bold("  Git status per space"), String::new()];
     if spaces.is_empty() {
         lines.push(style.dim("  No spaces open."));
@@ -135,7 +137,7 @@ fn render_styled(spaces: &[Space], style: &Style) -> String {
         lines.push(format!("      {}", style.dim(&branch_display(&sp.git))));
         lines.push(format!(
             "      {}   {}",
-            style.status(&sp.git, &status_cell(&sp.git)),
+            style.status(&sp.git, &status_cell(&sp.git, icons)),
             style.dim(&notes),
         ));
         lines.push(String::new());
@@ -386,20 +388,21 @@ mod tests {
 
     #[test]
     fn status_cell_variants() {
-        assert_eq!(status_cell(&GitStatus::default()), "—"); // non-repo
-        assert_eq!(status_cell(&repo("main")), "✓"); // repo, fully clean
+        let icons = Icons::default();
+        assert_eq!(status_cell(&GitStatus::default(), &icons), "—"); // non-repo
+        assert_eq!(status_cell(&repo("main"), &icons), "✓"); // repo, fully clean
         let dirty = GitStatus {
             staged: 1,
             untracked: 2,
             ..repo("main")
         };
-        assert_eq!(status_cell(&dirty), "+1 ?2");
+        assert_eq!(status_cell(&dirty, &icons), "+1 ?2");
         // clean working tree but ahead/behind != 0 shows "clean"
         let ahead = GitStatus {
             ahead: 1,
             ..repo("main")
         };
-        assert_eq!(status_cell(&ahead), "clean");
+        assert_eq!(status_cell(&ahead, &icons), "clean");
     }
 
     // ---- severity colouring --------------------------------------------------
@@ -425,7 +428,7 @@ mod tests {
 
     #[test]
     fn render_empty_spaces() {
-        let out = render_styled(&[], &plain());
+        let out = render_styled(&[], &plain(), &Icons::default());
         assert_eq!(out, "  Git status per space\n\n  No spaces open.");
     }
 
@@ -438,7 +441,7 @@ mod tests {
             ahead: 1,
             ..repo("feature/x")
         };
-        let out = render_styled(&[space("main", true, git, 2)], &plain());
+        let out = render_styled(&[space("main", true, git, 2)], &plain(), &Icons::default());
         let lines: Vec<&str> = out.split('\n').collect();
         assert_eq!(lines[0], "  Git status per space");
         assert_eq!(lines[1], "");
@@ -456,7 +459,7 @@ mod tests {
 
     #[test]
     fn render_unfocused_clean_singular_pane() {
-        let out = render_styled(&[space("s", false, repo("main"), 1)], &plain());
+        let out = render_styled(&[space("s", false, repo("main"), 1)], &plain(), &Icons::default());
         let lines: Vec<&str> = out.split('\n').collect();
         assert_eq!(lines[2], "  ○ s"); // unfocused marker
         assert_eq!(lines[3], "      main");
